@@ -1,6 +1,7 @@
 #include <fmt/ranges.h>
 
 #include <algorithm>
+#include <cmath>
 #include <feetech_driver/common.hpp>
 #include <feetech_driver/communication_protocol.hpp>
 #include <feetech_ros2_driver/feetech_ros2_driver.hpp>
@@ -24,6 +25,9 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
 #endif
     return CallbackReturn::ERROR;
   }
+
+  active_.store(false, std::memory_order_relaxed);
+  spdlog::info("Feetech safety guards enabled: activation gate and command validation");
 
   if (init_transport_() != CallbackReturn::SUCCESS) {
     return CallbackReturn::ERROR;
@@ -141,7 +145,8 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
     }
 
     // Single-byte parameters (0-255)
-    for (const auto& [parameter_name, address] : {std::pair{"p_coefficient", SMS_STS_P_COEF},
+    for (const auto& [parameter_name, address] : {std::pair{"operating_mode", SMS_STS_MODE},
+                                                  std::pair{"p_coefficient", SMS_STS_P_COEF},
                                                   {"d_coefficient", SMS_STS_D_COEF},
                                                   {"i_coefficient", SMS_STS_I_COEF},
                                                   {"overload_torque", SMS_STS_OVERLOAD_TORQUE},
@@ -194,13 +199,8 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
       return CallbackReturn::ERROR;
     }
 
-    // Only enable torque for joints with command interfaces (Follower Arm)
-    if (!joint.command_interfaces.empty()) {
-      if (const auto result = communication_protocol_->set_torque(joint_ids_[i], true); !result) {
-        spdlog::error("FeetechHardwareInterface::configure_joints_ set_torque -> {}", result.error());
-        return CallbackReturn::ERROR;
-      }
-    }
+    // Keep torque disabled until on_activate() has read the current position and
+    // initialized every command interface. This also makes activation failures safe.
   }
 
   return CallbackReturn::SUCCESS;
@@ -276,6 +276,12 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
 
 hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Time& /* time */,
                                                                 const rclcpp::Duration& /* period */) {
+  // controller_manager may call write() concurrently with a lifecycle
+  // transition. Never transmit an uninitialized command.
+  if (!active_.load(std::memory_order_acquire)) {
+    return hardware_interface::return_type::OK;
+  }
+
   // Create vectors only for joints that have command interfaces
   std::vector<uint8_t> commanded_joint_ids;
   std::vector<int> commanded_positions;
@@ -285,8 +291,25 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
   for (uint i = 0; i < info_.joints.size(); i++) {
     // Only include joints with command interfaces
     if (!info_.joints[i].command_interfaces.empty()) {
+      const double position = hw_positions_[i];
+      if (!std::isfinite(position)) {
+        spdlog::error("Refusing non-finite position command for joint '{}'", info_.joints[i].name);
+        return hardware_interface::return_type::ERROR;
+      }
+
+      const int position_ticks = feetech_driver::from_radians(position);
+      const int raw_position = position_ticks + feetech_driver::kStsMidpoint;
+      const int max_raw_position = static_cast<int>(feetech_driver::kStsResolution) - 1;
+      if (raw_position < 0 || raw_position > max_raw_position) {
+        spdlog::error("Refusing out-of-range position command for joint '{}': {} rad (raw {})",
+                      info_.joints[i].name,
+                      position,
+                      raw_position);
+        return hardware_interface::return_type::ERROR;
+      }
+
       commanded_joint_ids.push_back(joint_ids_[i]);
-      commanded_positions.push_back(feetech_driver::from_radians(hw_positions_[i]) + feetech_driver::kStsMidpoint);
+      commanded_positions.push_back(raw_position);
       commanded_speeds.push_back(2400);       // Default speed
       commanded_accelerations.push_back(50);  // Default acceleration
     }
@@ -306,14 +329,43 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
 }
 
 CallbackReturn FeetechHardwareInterface::on_activate(const rclcpp_lifecycle::State& /* previous_state */) {
+  active_.store(false, std::memory_order_release);
+
   // Time/Duration are not used
-  read(rclcpp::Time{}, rclcpp::Duration::from_seconds(0));
+  if (read(rclcpp::Time{}, rclcpp::Duration::from_seconds(0)) != hardware_interface::return_type::OK) {
+    spdlog::error("FeetechHardwareInterface::on_activate failed to read the initial joint positions");
+    return CallbackReturn::ERROR;
+  }
+
   // Set the initial command to current joint positions
   hw_positions_ = state_hw_positions_;
+
+  for (uint i = 0; i < info_.joints.size(); ++i) {
+    if (info_.joints[i].command_interfaces.empty()) {
+      continue;
+    }
+    if (!std::isfinite(hw_positions_[i])) {
+      spdlog::error("FeetechHardwareInterface::on_activate read a non-finite position for joint '{}'",
+                    info_.joints[i].name);
+      return CallbackReturn::ERROR;
+    }
+    if (const auto result = communication_protocol_->set_torque(joint_ids_[i], true); !result) {
+      spdlog::error("FeetechHardwareInterface::on_activate set_torque -> {}", result.error());
+      const auto torque_disable_parameters =
+          std::vector(joint_ids_.size(), std::experimental::make_array(static_cast<uint8_t>(0)));
+      std::ignore = communication_protocol_->sync_write(joint_ids_, SMS_STS_TORQUE_ENABLE, torque_disable_parameters);
+      return CallbackReturn::ERROR;
+    }
+  }
+
+  active_.store(true, std::memory_order_release);
   return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn FeetechHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& /* previous_state */) {
+  // Block write() before touching the bus or disabling torque.
+  active_.store(false, std::memory_order_release);
+
   // all joints torque off
   const auto torque_disable_parameters =
       std::vector(joint_ids_.size(), std::experimental::make_array(static_cast<uint8_t>(0)));

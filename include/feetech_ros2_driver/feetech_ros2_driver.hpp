@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <feetech_driver/communication_protocol.hpp>
 #include <feetech_driver/serial_port.hpp>
 #include <hardware_interface/handle.hpp>
@@ -50,6 +51,7 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   std::vector<uint8_t> previous_hw_positions_;
 
   std::vector<uint8_t> joint_ids_;
+  std::atomic_bool active_{false};
 
   CallbackReturn init_transport_();
   CallbackReturn load_yaml_config_and_warn_(JointIdConfigMap& out_yaml);
