@@ -1,14 +1,17 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <feetech_driver/communication_protocol.hpp>
 #include <feetech_driver/serial_port.hpp>
 #include <hardware_interface/handle.hpp>
 #include <hardware_interface/hardware_info.hpp>
 #include <hardware_interface/system_interface.hpp>
 #include <map>
+#include <mutex>
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
 #include <rclcpp_lifecycle/state.hpp>
+#include <string_view>
 #include <vector>
 
 #if __has_include(<hardware_interface/hardware_interface/version.h>)
@@ -54,8 +57,17 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   std::vector<int> joint_speeds_;
   std::vector<int> joint_accelerations_;
   std::atomic_bool active_{false};
+  std::atomic_bool lifecycle_active_{false};
+  bool connected_{false};
+  bool auto_reconnect_{true};
+  std::chrono::milliseconds reconnect_interval_{1000};
+  std::chrono::steady_clock::time_point next_reconnect_attempt_{};
+  std::mutex transport_mutex_;
 
   CallbackReturn init_transport_();
+  bool read_bus_();
+  bool recover_connection_();
+  void mark_disconnected_(std::string_view operation, std::string_view error);
   CallbackReturn load_yaml_config_and_warn_(JointIdConfigMap& out_yaml);
   CallbackReturn configure_joints_(const JointIdConfigMap& yaml_by_id);
   CallbackReturn validate_model_series_();

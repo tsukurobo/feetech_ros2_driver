@@ -10,6 +10,8 @@ The feetech system interface has a few `ros2_control` urdf tags to customize its
 
 * `usb_port` (required). Example: `<param name="usb_port">/dev/ttyUSB0</param>`.
 * `joint_config_file` (optional): Path to a YAML file with per-joint parameters. If omitted, only URDF params are used (backward-compatible). See [YAML Joint Configuration](#yaml-joint-configuration-file) below.
+* `auto_reconnect` (optional): Reopen the serial port and restore communication after a runtime USB or servo power interruption. Defaults to `true`.
+* `reconnect_interval_ms` (optional): Minimum delay between reconnection attempts in milliseconds. Defaults to `1000`.
 
 #### Per-joint Parameters
 

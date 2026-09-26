@@ -76,10 +76,25 @@ Expected<LibSerial::BaudRate> to_baudrate(const std::size_t baud) noexcept {
   return tl::make_unexpected(fmt::format("Invalid baud rate: [{}]", baud));
 }
 
-SerialPort::SerialPort(const std::string& dev) : dev_(dev) { spdlog::info("Connecting to port: {}", dev); }
+SerialPort::SerialPort(const std::string& dev) : dev_(dev), port_(std::make_unique<LibSerial::SerialPort>()) {
+  spdlog::info("Connecting to port: {}", dev);
+}
 
-SerialPort::~SerialPort() {
-  (void)close();  // explicitly discards result
+SerialPort::~SerialPort() noexcept {
+  if (!port_) {
+    return;
+  }
+  if (!healthy_) {
+    (void)port_.release();
+    return;
+  }
+  try {
+    if (port_->IsOpen()) {
+      port_->Close();
+    }
+  } catch (...) {
+    (void)port_.release();
+  }
 }
 
 Result SerialPort::configure(const LibSerial::BaudRate baud_rate) {
@@ -88,8 +103,9 @@ Result SerialPort::configure(const LibSerial::BaudRate baud_rate) {
   }
 
   try {
-    port_.SetBaudRate(baud_rate);
+    port_->SetBaudRate(baud_rate);
   } catch (const std::runtime_error& e) {
+    healthy_ = false;
     return tl::make_unexpected(fmt::format("Configuring the serial port failed: [{}]", e.what()));
   }
   return {};
@@ -97,8 +113,8 @@ Result SerialPort::configure(const LibSerial::BaudRate baud_rate) {
 
 Result SerialPort::open() {
   try {
-    if (!port_.IsOpen()) {
-      port_.Open(dev_);
+    if (!port_->IsOpen()) {
+      port_->Open(dev_);
     }
   } catch (const LibSerial::OpenFailed& e) {
     return tl::make_unexpected(fmt::format("Open [{}]: {}", dev_.c_str(), e.what()));
@@ -109,7 +125,12 @@ Result SerialPort::open() {
 
 Result SerialPort::close() {
   try {
-    port_.Close();
+    if (!port_->IsOpen()) {
+      return {};
+    }
+    port_->Close();
+  } catch (const LibSerial::NotOpen& e) {
+    return tl::make_unexpected(fmt::format("close [{}]: {}", dev_.c_str(), e.what()));
   } catch (const LibSerial::AlreadyOpen& e) {
     return tl::make_unexpected(fmt::format("close [{}]: {}", dev_.c_str(), e.what()));
   } catch (const std::runtime_error& e) {
@@ -119,7 +140,7 @@ Result SerialPort::close() {
 }
 
 Result SerialPort::check_port() const noexcept {
-  if (!port_.IsOpen()) {
+  if (!port_->IsOpen()) {
     return tl::make_unexpected(fmt::format("Port [{}] is not open", dev_));
   }
 
@@ -132,7 +153,7 @@ Result SerialPort::flashInputBuffer() noexcept {
   }
 
   try {
-    port_.FlushInputBuffer();
+    port_->FlushInputBuffer();
   } catch (const std::runtime_error& e) {
     return tl::make_unexpected(e.what());
   }
@@ -146,7 +167,7 @@ Result SerialPort::flashOutputBuffer() noexcept {
   }
 
   try {
-    port_.FlushOutputBuffer();
+    port_->FlushOutputBuffer();
   } catch (const std::runtime_error& e) {
     return tl::make_unexpected(e.what());
   }

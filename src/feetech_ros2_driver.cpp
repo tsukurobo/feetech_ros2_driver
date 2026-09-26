@@ -1,6 +1,7 @@
 #include <fmt/ranges.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <feetech_driver/common.hpp>
 #include <feetech_driver/communication_protocol.hpp>
@@ -27,6 +28,7 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
   }
 
   active_.store(false, std::memory_order_relaxed);
+  lifecycle_active_.store(false, std::memory_order_relaxed);
   spdlog::info("Feetech safety guards enabled: activation gate and command validation");
 
   if (init_transport_() != CallbackReturn::SUCCESS) {
@@ -44,6 +46,20 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
 
   if (validate_model_series_() != CallbackReturn::SUCCESS) {
     return CallbackReturn::ERROR;
+  }
+
+  connected_ = true;
+
+  if (const auto it = info_.hardware_parameters.find("auto_reconnect"); it != info_.hardware_parameters.end()) {
+    auto_reconnect_ = it->second == "true" || it->second == "1";
+  }
+  if (const auto it = info_.hardware_parameters.find("reconnect_interval_ms"); it != info_.hardware_parameters.end()) {
+    const int interval_ms = std::stoi(it->second);
+    if (interval_ms < 1) {
+      spdlog::error("reconnect_interval_ms must be at least 1, got {}", interval_ms);
+      return CallbackReturn::ERROR;
+    }
+    reconnect_interval_ = std::chrono::milliseconds(interval_ms);
   }
 
   return CallbackReturn::SUCCESS;
@@ -274,12 +290,24 @@ std::vector<hardware_interface::CommandInterface> FeetechHardwareInterface::expo
 
 hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Time& /* time */,
                                                                const rclcpp::Duration& /* period */) {
-  // 4 = 2 bytes for position + 2 bytes for speed
+  std::scoped_lock lock(transport_mutex_);
+  if (!connected_) {
+    if (lifecycle_active_.load(std::memory_order_acquire) && auto_reconnect_) {
+      std::ignore = recover_connection_();
+    }
+    return hardware_interface::return_type::OK;
+  }
+
+  std::ignore = read_bus_();
+  return hardware_interface::return_type::OK;
+}
+
+bool FeetechHardwareInterface::read_bus_() {
   std::vector<std::array<uint8_t, 4>> data;
   data.reserve(joint_ids_.size());
   if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L, &data); !result) {
-    spdlog::error("FeetechHardwareInterface::read -> {}", result.error());
-    return hardware_interface::return_type::ERROR;
+    mark_disconnected_("read", result.error());
+    return false;
   }
   ranges::for_each(data | ranges::views::enumerate, [&](const auto& values) {
     const auto& [index, readings] = values;
@@ -289,7 +317,7 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
     state_hw_velocities_[index] = feetech_driver::to_radians(
         feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[2], .high = readings[3]}));
   });
-  return hardware_interface::return_type::OK;
+  return true;
 }
 
 hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Time& /* time */,
@@ -297,6 +325,11 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
   // controller_manager may call write() concurrently with a lifecycle
   // transition. Never transmit an uninitialized command.
   if (!active_.load(std::memory_order_acquire)) {
+    return hardware_interface::return_type::OK;
+  }
+
+  std::scoped_lock lock(transport_mutex_);
+  if (!connected_) {
     return hardware_interface::return_type::OK;
   }
 
@@ -338,8 +371,8 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
     const auto write_result = communication_protocol_->sync_write_position(
         commanded_joint_ids, commanded_positions, commanded_speeds, commanded_accelerations);
     if (!write_result) {
-      spdlog::error("FeetechHardwareInterface::write -> {}", write_result.error());
-      return hardware_interface::return_type::ERROR;
+      mark_disconnected_("write", write_result.error());
+      return hardware_interface::return_type::OK;
     }
   }
 
@@ -348,9 +381,10 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
 
 CallbackReturn FeetechHardwareInterface::on_activate(const rclcpp_lifecycle::State& /* previous_state */) {
   active_.store(false, std::memory_order_release);
+  lifecycle_active_.store(false, std::memory_order_release);
 
-  // Time/Duration are not used
-  if (read(rclcpp::Time{}, rclcpp::Duration::from_seconds(0)) != hardware_interface::return_type::OK) {
+  std::scoped_lock lock(transport_mutex_);
+  if (!connected_ || !read_bus_()) {
     spdlog::error("FeetechHardwareInterface::on_activate failed to read the initial joint positions");
     return CallbackReturn::ERROR;
   }
@@ -377,12 +411,19 @@ CallbackReturn FeetechHardwareInterface::on_activate(const rclcpp_lifecycle::Sta
   }
 
   active_.store(true, std::memory_order_release);
+  lifecycle_active_.store(true, std::memory_order_release);
   return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn FeetechHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& /* previous_state */) {
   // Block write() before touching the bus or disabling torque.
   active_.store(false, std::memory_order_release);
+  lifecycle_active_.store(false, std::memory_order_release);
+
+  std::scoped_lock lock(transport_mutex_);
+  if (!connected_) {
+    return CallbackReturn::SUCCESS;
+  }
 
   // all joints torque off
   const auto torque_disable_parameters =
@@ -394,6 +435,53 @@ CallbackReturn FeetechHardwareInterface::on_deactivate(const rclcpp_lifecycle::S
     return CallbackReturn::ERROR;
   }
   return CallbackReturn::SUCCESS;
+}
+
+void FeetechHardwareInterface::mark_disconnected_(const std::string_view operation, const std::string_view error) {
+  if (connected_) {
+    spdlog::error("Feetech communication lost during {}: {}. Retrying every {} ms",
+                  operation,
+                  error,
+                  reconnect_interval_.count());
+  }
+  connected_ = false;
+  active_.store(false, std::memory_order_release);
+  communication_protocol_.reset();
+  next_reconnect_attempt_ = std::chrono::steady_clock::now() + reconnect_interval_;
+}
+
+bool FeetechHardwareInterface::recover_connection_() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now < next_reconnect_attempt_) {
+    return false;
+  }
+  next_reconnect_attempt_ = now + reconnect_interval_;
+
+  if (init_transport_() != CallbackReturn::SUCCESS) {
+    communication_protocol_.reset();
+    return false;
+  }
+  connected_ = true;
+  if (validate_model_series_() != CallbackReturn::SUCCESS || !read_bus_()) {
+    communication_protocol_.reset();
+    connected_ = false;
+    return false;
+  }
+
+  hw_positions_ = state_hw_positions_;
+  for (size_t i = 0; i < info_.joints.size(); ++i) {
+    if (info_.joints[i].command_interfaces.empty()) {
+      continue;
+    }
+    if (const auto result = communication_protocol_->set_torque(joint_ids_[i], true); !result) {
+      mark_disconnected_("recovery torque enable", result.error());
+      return false;
+    }
+  }
+
+  active_.store(true, std::memory_order_release);
+  spdlog::info("Feetech connection recovered; commands synchronized to current positions");
+  return true;
 }
 
 }  // namespace feetech_ros2_driver
