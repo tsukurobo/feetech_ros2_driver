@@ -112,6 +112,8 @@ CallbackReturn FeetechHardwareInterface::load_yaml_config_and_warn_(JointIdConfi
 
 CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMap& yaml_by_id) {
   joint_ids_.assign(info_.joints.size(), 0);
+  joint_speeds_.assign(info_.joints.size(), 2400);
+  joint_accelerations_.assign(info_.joints.size(), 50);
 
   for (size_t i = 0; i < info_.joints.size(); ++i) {
     const auto& joint = info_.joints[i];
@@ -136,6 +138,22 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
 
     if (merged_params.find("offset") != merged_params.end()) {
       spdlog::warn("Joint '{}': 'offset' param is deprecated and ignored — use 'homing_offset' instead", joint_name);
+    }
+
+    if (const auto speed_it = merged_params.find("speed"); speed_it != merged_params.end()) {
+      joint_speeds_[i] = std::stoi(speed_it->second);
+    }
+    if (joint_speeds_[i] < 0 || joint_speeds_[i] > 32767) {
+      spdlog::error("Joint '{}': speed must be in [0, 32767], got {}", joint_name, joint_speeds_[i]);
+      return CallbackReturn::ERROR;
+    }
+
+    if (const auto acceleration_it = merged_params.find("acceleration"); acceleration_it != merged_params.end()) {
+      joint_accelerations_[i] = std::stoi(acceleration_it->second);
+    }
+    if (joint_accelerations_[i] < 0 || joint_accelerations_[i] > 254) {
+      spdlog::error("Joint '{}': acceleration must be in [0, 254], got {}", joint_name, joint_accelerations_[i]);
+      return CallbackReturn::ERROR;
     }
 
     // Disable torque and unlock EPROM before writing parameters
@@ -310,8 +328,8 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
 
       commanded_joint_ids.push_back(joint_ids_[i]);
       commanded_positions.push_back(raw_position);
-      commanded_speeds.push_back(2400);       // Default speed
-      commanded_accelerations.push_back(50);  // Default acceleration
+      commanded_speeds.push_back(joint_speeds_[i]);
+      commanded_accelerations.push_back(joint_accelerations_[i]);
     }
   }
 

@@ -51,6 +51,8 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   std::vector<uint8_t> previous_hw_positions_;
 
   std::vector<uint8_t> joint_ids_;
+  std::vector<int> joint_speeds_;
+  std::vector<int> joint_accelerations_;
   std::atomic_bool active_{false};
 
   CallbackReturn init_transport_();

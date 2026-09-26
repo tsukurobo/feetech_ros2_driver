@@ -26,7 +26,8 @@ Make sure to look at [Memory table](https://docs.google.com/spreadsheets/d/1GVs7
 * `protection_current` (optional): Protection current threshold.
 * `overload_torque` (optional): Overload torque threshold.
 * `return_delay_time` (optional): Response delay time.
-* `acceleration` (optional): Acceleration value.
+* `speed` (optional): Position command speed in raw servo units (0–32767). Defaults to 2400.
+* `acceleration` (optional): Position command acceleration in raw servo units (0–254). Defaults to 50.
 
 ### Example
 
@@ -53,6 +54,7 @@ joints:
     i_coefficient: 0
     d_coefficient: 32
     return_delay_time: 0
+    speed: 200
     acceleration: 254
 ```
 
