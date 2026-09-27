@@ -16,12 +16,24 @@
 #include <tuple>
 #include <vector>
 
-namespace feetech_ros2_driver {
+namespace feetech_ros2_driver
+{
+namespace
+{
+constexpr uint8_t kMultiTurnPhaseBit = 0x10;
+constexpr int kMaxMultiTurnRotations = 7;
+constexpr int kMaxMultiTurnTicks =
+  kMaxMultiTurnRotations * static_cast<int>(feetech_driver::kStsResolution);
+}  // namespace
+
 #if HARDWARE_INTERFACE_VERSION_GTE(4, 34, 0)
-CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::HardwareComponentInterfaceParams& params) {
+CallbackReturn FeetechHardwareInterface::on_init(
+  const hardware_interface::HardwareComponentInterfaceParams & params)
+{
   if (hardware_interface::SystemInterface::on_init(params) != CallbackReturn::SUCCESS) {
 #else
-CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::HardwareInfo& info) {
+CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::HardwareInfo & info)
+{
   if (hardware_interface::SystemInterface::on_init(info) != CallbackReturn::SUCCESS) {
 #endif
     return CallbackReturn::ERROR;
@@ -50,10 +62,14 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
 
   connected_ = true;
 
-  if (const auto it = info_.hardware_parameters.find("auto_reconnect"); it != info_.hardware_parameters.end()) {
+  if (const auto it = info_.hardware_parameters.find("auto_reconnect");
+    it != info_.hardware_parameters.end())
+  {
     auto_reconnect_ = it->second == "true" || it->second == "1";
   }
-  if (const auto it = info_.hardware_parameters.find("reconnect_interval_ms"); it != info_.hardware_parameters.end()) {
+  if (const auto it = info_.hardware_parameters.find("reconnect_interval_ms");
+    it != info_.hardware_parameters.end())
+  {
     const int interval_ms = std::stoi(it->second);
     if (interval_ms < 1) {
       spdlog::error("reconnect_interval_ms must be at least 1, got {}", interval_ms);
@@ -65,7 +81,8 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn FeetechHardwareInterface::init_transport_() {
+CallbackReturn FeetechHardwareInterface::init_transport_()
+{
   const auto usb_port_it = info_.hardware_parameters.find("usb_port");
   if (usb_port_it == info_.hardware_parameters.end()) {
     spdlog::error(
@@ -76,19 +93,33 @@ CallbackReturn FeetechHardwareInterface::init_transport_() {
 
   auto serial_port = std::make_unique<feetech_driver::SerialPort>(usb_port_it->second);
 
-  if (const auto result = serial_port->configure(); !result) {
+  auto baud_rate = LibSerial::BaudRate::BAUD_1000000;
+  if (const auto baud_rate_it = info_.hardware_parameters.find("baud_rate");
+    baud_rate_it != info_.hardware_parameters.end())
+  {
+    const auto parsed_baud_rate = feetech_driver::to_baudrate(std::stoul(baud_rate_it->second));
+    if (!parsed_baud_rate) {
+      spdlog::error("FeetechHardwareInterface::init_transport_ -> {}", parsed_baud_rate.error());
+      return CallbackReturn::ERROR;
+    }
+    baud_rate = *parsed_baud_rate;
+  }
+
+  if (const auto result = serial_port->configure(baud_rate); !result) {
     spdlog::error("FeetechHardwareInterface::init_transport_ -> {}", result.error());
     return CallbackReturn::ERROR;
   }
 
-  communication_protocol_ = std::make_unique<feetech_driver::CommunicationProtocol>(std::move(serial_port));
+  communication_protocol_ =
+    std::make_unique<feetech_driver::CommunicationProtocol>(std::move(serial_port));
 
   return CallbackReturn::SUCCESS;
 }
 
 // Optional YAML overlay — if not provided, URDF params are used as-is.
 // Builds an ID-keyed map: URDF id is the hardware identity, YAML name is just a label.
-CallbackReturn FeetechHardwareInterface::load_yaml_config_and_warn_(JointIdConfigMap& out_yaml) {
+CallbackReturn FeetechHardwareInterface::load_yaml_config_and_warn_(JointIdConfigMap & out_yaml)
+{
   out_yaml.clear();
 
   const auto cfg_it = info_.hardware_parameters.find("joint_config_file");
@@ -102,7 +133,7 @@ CallbackReturn FeetechHardwareInterface::load_yaml_config_and_warn_(JointIdConfi
   }
 
   // Re-key by servo id
-  for (auto& [name, params] : *loaded) {
+  for (auto & [name, params] : *loaded) {
     auto it = params.find("id");
     if (it == params.end()) {
       spdlog::error("YAML joint '{}' has no 'id' parameter", name);
@@ -116,24 +147,27 @@ CallbackReturn FeetechHardwareInterface::load_yaml_config_and_warn_(JointIdConfi
   }
 
   // Warn: URDF ids missing in YAML
-  for (const auto& j : info_.joints) {
+  for (const auto & j : info_.joints) {
     auto id_it = j.parameters.find("id");
     if (id_it != j.parameters.end() && out_yaml.find(std::stoi(id_it->second)) == out_yaml.end()) {
-      spdlog::warn("URDF joint '{}' (id={}) has no YAML entry (using URDF defaults)", j.name, id_it->second);
+      spdlog::warn("URDF joint '{}' (id={}) has no YAML entry (using URDF defaults)", j.name,
+          id_it->second);
     }
   }
 
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMap& yaml_by_id) {
+CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMap & yaml_by_id)
+{
   joint_ids_.assign(info_.joints.size(), 0);
   joint_speeds_.assign(info_.joints.size(), 2400);
   joint_accelerations_.assign(info_.joints.size(), 50);
+  joint_multi_turn_.assign(info_.joints.size(), false);
 
   for (size_t i = 0; i < info_.joints.size(); ++i) {
-    const auto& joint = info_.joints[i];
-    const std::string& joint_name = joint.name;
+    const auto & joint = info_.joints[i];
+    const std::string & joint_name = joint.name;
 
     // Required: id (from URDF — hardware identity)
     const auto urdf_id_it = joint.parameters.find("id");
@@ -153,42 +187,122 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
     }
 
     if (merged_params.find("offset") != merged_params.end()) {
-      spdlog::warn("Joint '{}': 'offset' param is deprecated and ignored — use 'homing_offset' instead", joint_name);
+      spdlog::warn(
+          "Joint '{}': 'offset' param is deprecated and ignored — use 'homing_offset' instead",
+          joint_name);
+    }
+
+    if (const auto multi_turn_it = merged_params.find("multi_turn");
+      multi_turn_it != merged_params.end())
+    {
+      if (multi_turn_it->second == "true" || multi_turn_it->second == "1") {
+        joint_multi_turn_[i] = true;
+      } else if (multi_turn_it->second != "false" && multi_turn_it->second != "0") {
+        spdlog::error(
+          "Joint '{}': multi_turn must be true, false, 1, or 0; got '{}'", joint_name,
+          multi_turn_it->second);
+        return CallbackReturn::ERROR;
+      }
+    }
+
+    if (joint_multi_turn_[i]) {
+      if (
+        (merged_params.contains("range_min") && merged_params["range_min"] != "0") ||
+        (merged_params.contains("range_max") && merged_params["range_max"] != "0"))
+      {
+        spdlog::warn(
+          "Joint '{}': forcing range_min and range_max to 0 for multi-turn control",
+          joint_name);
+      }
+      merged_params["range_min"] = "0";
+      merged_params["range_max"] = "0";
     }
 
     if (const auto speed_it = merged_params.find("speed"); speed_it != merged_params.end()) {
       joint_speeds_[i] = std::stoi(speed_it->second);
     }
     if (joint_speeds_[i] < 0 || joint_speeds_[i] > 32767) {
-      spdlog::error("Joint '{}': speed must be in [0, 32767], got {}", joint_name, joint_speeds_[i]);
+      spdlog::error("Joint '{}': speed must be in [0, 32767], got {}", joint_name,
+          joint_speeds_[i]);
       return CallbackReturn::ERROR;
     }
 
-    if (const auto acceleration_it = merged_params.find("acceleration"); acceleration_it != merged_params.end()) {
+    if (const auto acceleration_it =
+      merged_params.find("acceleration"); acceleration_it != merged_params.end())
+    {
       joint_accelerations_[i] = std::stoi(acceleration_it->second);
     }
     if (joint_accelerations_[i] < 0 || joint_accelerations_[i] > 254) {
-      spdlog::error("Joint '{}': acceleration must be in [0, 254], got {}", joint_name, joint_accelerations_[i]);
+      spdlog::error("Joint '{}': acceleration must be in [0, 254], got {}", joint_name,
+          joint_accelerations_[i]);
       return CallbackReturn::ERROR;
     }
 
     // Disable torque and unlock EPROM before writing parameters
     if (const auto result = communication_protocol_->disable_torque(joint_ids_[i]); !result) {
-      spdlog::error("FeetechHardwareInterface::configure_joints_ disable_torque -> {}", result.error());
+      spdlog::error("FeetechHardwareInterface::configure_joints_ disable_torque -> {}",
+          result.error());
       return CallbackReturn::ERROR;
     }
 
+    if (merged_params.find("multi_turn") != merged_params.end()) {
+      std::array<uint8_t, 1> phase{};
+      if (const auto result = communication_protocol_->read(
+          joint_ids_[i], SMS_STS_PHASE, &phase); !result)
+      {
+        spdlog::error(
+          "Joint '{}': failed to read phase register: {}", joint_name, result.error());
+        return CallbackReturn::ERROR;
+      }
+      const uint8_t configured_phase = joint_multi_turn_[i] ?
+        static_cast<uint8_t>(phase[0] | kMultiTurnPhaseBit) :
+        static_cast<uint8_t>(phase[0] & static_cast<uint8_t>(~kMultiTurnPhaseBit));
+      if (configured_phase != phase[0]) {
+        if (const auto result = communication_protocol_->write(
+            joint_ids_[i], SMS_STS_PHASE, std::array<uint8_t, 1>{configured_phase}); !result)
+        {
+          spdlog::error(
+            "Joint '{}': failed to configure multi-turn feedback: {}", joint_name,
+            result.error());
+          return CallbackReturn::ERROR;
+        }
+      }
+      std::array<uint8_t, 1> verified_phase{};
+      if (const auto result = communication_protocol_->read(
+          joint_ids_[i], SMS_STS_PHASE, &verified_phase); !result)
+      {
+        spdlog::error(
+          "Joint '{}': failed to verify multi-turn feedback: {}", joint_name,
+          result.error());
+        return CallbackReturn::ERROR;
+      }
+      const bool multi_turn_enabled = (verified_phase[0] & kMultiTurnPhaseBit) != 0;
+      if (multi_turn_enabled != joint_multi_turn_[i]) {
+        spdlog::error(
+          "Joint '{}': multi-turn feedback verification failed (phase=0x{:02x})",
+          joint_name, verified_phase[0]);
+        return CallbackReturn::ERROR;
+      }
+      spdlog::info(
+        "Joint '{}': multi-turn position feedback {}", joint_name,
+        joint_multi_turn_[i] ? "enabled" : "disabled");
+    }
+
     // Single-byte parameters (0-255)
-    for (const auto& [parameter_name, address] : {std::pair{"operating_mode", SMS_STS_MODE},
-                                                  std::pair{"p_coefficient", SMS_STS_P_COEF},
-                                                  {"d_coefficient", SMS_STS_D_COEF},
-                                                  {"i_coefficient", SMS_STS_I_COEF},
-                                                  {"overload_torque", SMS_STS_OVERLOAD_TORQUE},
-                                                  {"return_delay_time", SMS_STS_RETURN_DELAY},
-                                                  {"acceleration", SMS_STS_ACC}}) {
-      if (const auto param_it = merged_params.find(parameter_name); param_it != merged_params.end()) {
+    for (const auto & [parameter_name, address] : {std::pair{"operating_mode", SMS_STS_MODE},
+        std::pair{"p_coefficient", SMS_STS_P_COEF},
+        {"d_coefficient", SMS_STS_D_COEF},
+        {"i_coefficient", SMS_STS_I_COEF},
+        {"overload_torque", SMS_STS_OVERLOAD_TORQUE},
+        {"return_delay_time", SMS_STS_RETURN_DELAY},
+        {"acceleration", SMS_STS_ACC}})
+    {
+      if (const auto param_it = merged_params.find(parameter_name);
+        param_it != merged_params.end())
+      {
         const auto result = communication_protocol_->write(
-            joint_ids_[i], address, std::experimental::make_array(static_cast<uint8_t>(std::stoi(param_it->second))));
+            joint_ids_[i], address,
+            std::experimental::make_array(static_cast<uint8_t>(std::stoi(param_it->second))));
         if (!result) {
           spdlog::error("FeetechHardwareInterface::configure_joints_ -> {}", result.error());
           return CallbackReturn::ERROR;
@@ -197,11 +311,15 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
     }
 
     // Two-byte unsigned parameters
-    for (const auto& [parameter_name, address] : {std::pair{"range_min", SMS_STS_MIN_ANGLE_LIMIT_L},
-                                                  {"range_max", SMS_STS_MAX_ANGLE_LIMIT_L},
-                                                  {"max_torque_limit", SMS_STS_MAX_TORQUE_L},
-                                                  {"protection_current", SMS_STS_PROTECTION_CURRENT_L}}) {
-      if (const auto param_it = merged_params.find(parameter_name); param_it != merged_params.end()) {
+    for (const auto & [parameter_name,
+      address] : {std::pair{"range_min", SMS_STS_MIN_ANGLE_LIMIT_L},
+        {"range_max", SMS_STS_MAX_ANGLE_LIMIT_L},
+        {"max_torque_limit", SMS_STS_MAX_TORQUE_L},
+        {"protection_current", SMS_STS_PROTECTION_CURRENT_L}})
+    {
+      if (const auto param_it = merged_params.find(parameter_name);
+        param_it != merged_params.end())
+      {
         std::array<uint8_t, 2> buf{};
         feetech_driver::to_sts(&buf[0], &buf[1], std::stoi(param_it->second));
         const auto result = communication_protocol_->write(joint_ids_[i], address, buf);
@@ -212,12 +330,34 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
       }
     }
 
+    if (joint_multi_turn_[i]) {
+      const auto range_min =
+        communication_protocol_->read_word(joint_ids_[i], SMS_STS_MIN_ANGLE_LIMIT_L);
+      const auto range_max =
+        communication_protocol_->read_word(joint_ids_[i], SMS_STS_MAX_ANGLE_LIMIT_L);
+      if (!range_min || !range_max) {
+        spdlog::error("Joint '{}': failed to verify multi-turn angle limits", joint_name);
+        return CallbackReturn::ERROR;
+      }
+      if (*range_min != 0 || *range_max != 0) {
+        spdlog::error(
+          "Joint '{}': multi-turn angle-limit verification failed (min={}, max={})",
+          joint_name, *range_min, *range_max);
+        return CallbackReturn::ERROR;
+      }
+      spdlog::info("Joint '{}': multi-turn angle limits verified", joint_name);
+    }
+
     // Two-byte signed parameters (sign-magnitude encoding)
-    for (const auto& [parameter_name, address, sign_bit] :
-         {std::tuple{"homing_offset", SMS_STS_OFS_L, SMS_STS_SIGN_BIT_HOMING_OFFSET}}) {
-      if (const auto param_it = merged_params.find(parameter_name); param_it != merged_params.end()) {
+    for (const auto & [parameter_name, address, sign_bit] :
+      {std::tuple{"homing_offset", SMS_STS_OFS_L, SMS_STS_SIGN_BIT_HOMING_OFFSET}})
+    {
+      if (const auto param_it = merged_params.find(parameter_name);
+        param_it != merged_params.end())
+      {
         std::array<uint8_t, 2> buf{};
-        const int value = feetech_driver::encode_sign_magnitude(std::stoi(param_it->second), sign_bit);
+        const int value = feetech_driver::encode_sign_magnitude(std::stoi(param_it->second),
+            sign_bit);
         feetech_driver::to_sts(&buf[0], &buf[1], value);
         const auto result = communication_protocol_->write(joint_ids_[i], address, buf);
         if (!result) {
@@ -240,23 +380,34 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn FeetechHardwareInterface::validate_model_series_() {
+CallbackReturn FeetechHardwareInterface::validate_model_series_()
+{
   const auto joint_model_series = joint_ids_ | ranges::views::transform([&](const auto id) {
-                                    return communication_protocol_->read_model_number(id)
-                                        .and_then(feetech_driver::get_model_name)
-                                        .and_then(feetech_driver::get_model_series);
+        return communication_protocol_->read_model_number(id)
+               .and_then(feetech_driver::get_model_name)
+               .and_then(feetech_driver::get_model_series);
                                   });
 
-  if (std::ranges::any_of(joint_model_series, [](const auto& series) { return !series.has_value(); })) {
-    spdlog::error("FeetechHardware::validate_model_series_ [One of the joints has an error]. Input: {}",
+  if (std::ranges::any_of(joint_model_series, [](const auto & series) {
+      return !series.has_value();
+      }))
+  {
+    spdlog::error(
+        "FeetechHardware::validate_model_series_ [One of the joints has an error]. Input: {}",
                   ranges::views::zip(joint_ids_, joint_model_series));
     return CallbackReturn::ERROR;
   }
 
-  const auto js = joint_model_series | ranges::views::transform([](const auto& series) { return series.value(); });
+  const auto js = joint_model_series | ranges::views::transform([](const auto & series) {
+        return series.value();
+                                                                                                               });
 
-  if (ranges::any_of(js, [](const auto& series) { return series != feetech_driver::ModelSeries::kSts; })) {
-    spdlog::error("FeetechHardware::validate_model_series_ [Only STS series is supported]. Input (id, series): {}",
+  if (ranges::any_of(js, [](const auto & series) {
+      return series != feetech_driver::ModelSeries::kSts;
+                                                                                                     }))
+  {
+    spdlog::error(
+        "FeetechHardware::validate_model_series_ [Only STS series is supported]. Input (id, series): {}",
                   ranges::views::zip(joint_ids_, js));
     return CallbackReturn::ERROR;
   }
@@ -264,32 +415,40 @@ CallbackReturn FeetechHardwareInterface::validate_model_series_() {
   return CallbackReturn::SUCCESS;
 }
 
-std::vector<hardware_interface::StateInterface> FeetechHardwareInterface::export_state_interfaces() {
+std::vector<hardware_interface::StateInterface> FeetechHardwareInterface::export_state_interfaces()
+{
   std::vector<hardware_interface::StateInterface> state_interfaces;
   state_hw_positions_.resize(info_.joints.size(), 0.0);
   state_hw_velocities_.resize(info_.joints.size(), 0.0);
   for (uint i = 0; i < info_.joints.size(); i++) {
-    state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION, &state_hw_positions_[i]);
-    state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &state_hw_velocities_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION,
+        &state_hw_positions_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_VELOCITY,
+        &state_hw_velocities_[i]);
   }
 
   return state_interfaces;
 }
 
-std::vector<hardware_interface::CommandInterface> FeetechHardwareInterface::export_command_interfaces() {
+std::vector<hardware_interface::CommandInterface> FeetechHardwareInterface::
+export_command_interfaces()
+{
   std::vector<hardware_interface::CommandInterface> command_interfaces;
   hw_positions_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
   for (uint i = 0; i < info_.joints.size(); i++) {
     if (!info_.joints[i].command_interfaces.empty()) {
-      command_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_positions_[i]);
+      command_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION,
+          &hw_positions_[i]);
     }
   }
 
   return command_interfaces;
 }
 
-hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Time& /* time */,
-                                                               const rclcpp::Duration& /* period */) {
+hardware_interface::return_type FeetechHardwareInterface::read(
+  const rclcpp::Time & /* time */,
+  const rclcpp::Duration & /* period */)
+{
   std::scoped_lock lock(transport_mutex_);
   if (!connected_) {
     if (lifecycle_active_.load(std::memory_order_acquire) && auto_reconnect_) {
@@ -302,26 +461,37 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
   return hardware_interface::return_type::OK;
 }
 
-bool FeetechHardwareInterface::read_bus_() {
+bool FeetechHardwareInterface::read_bus_()
+{
   std::vector<std::array<uint8_t, 4>> data;
   data.reserve(joint_ids_.size());
-  if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L, &data); !result) {
+  if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L,
+      &data); !result)
+  {
     mark_disconnected_("read", result.error());
     return false;
   }
-  ranges::for_each(data | ranges::views::enumerate, [&](const auto& values) {
-    const auto& [index, readings] = values;
-    state_hw_positions_[index] = feetech_driver::to_radians(
-        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[0], .high = readings[1]}) -
-        feetech_driver::kStsMidpoint);
-    state_hw_velocities_[index] = feetech_driver::to_radians(
-        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[2], .high = readings[3]}));
+  ranges::for_each(data | ranges::views::enumerate, [&](const auto & values) {
+      const auto & [index, readings] = values;
+      const int encoded_position = feetech_driver::from_sts(
+        feetech_driver::WordBytes{.low = readings[0], .high = readings[1]});
+      const int position = joint_multi_turn_[index] ?
+      feetech_driver::decode_sign_magnitude(encoded_position, SMS_STS_SIGN_BIT_POSITION) :
+      encoded_position;
+      state_hw_positions_[index] =
+      feetech_driver::to_radians(position - feetech_driver::kStsMidpoint);
+      const int encoded_velocity = feetech_driver::from_sts(
+        feetech_driver::WordBytes{.low = readings[2], .high = readings[3]});
+      state_hw_velocities_[index] = feetech_driver::to_radians(
+        feetech_driver::decode_sign_magnitude(encoded_velocity, SMS_STS_SIGN_BIT_VELOCITY));
   });
   return true;
 }
 
-hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Time& /* time */,
-                                                                const rclcpp::Duration& /* period */) {
+hardware_interface::return_type FeetechHardwareInterface::write(
+  const rclcpp::Time & /* time */,
+  const rclcpp::Duration & /* period */)
+{
   // controller_manager may call write() concurrently with a lifecycle
   // transition. Never transmit an uninitialized command.
   if (!active_.load(std::memory_order_acquire)) {
@@ -350,8 +520,12 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
 
       const int position_ticks = feetech_driver::from_radians(position);
       const int raw_position = position_ticks + feetech_driver::kStsMidpoint;
-      const int max_raw_position = static_cast<int>(feetech_driver::kStsResolution) - 1;
-      if (raw_position < 0 || raw_position > max_raw_position) {
+      const int max_raw_position = joint_multi_turn_[i] ?
+        kMaxMultiTurnTicks + feetech_driver::kStsMidpoint :
+        static_cast<int>(feetech_driver::kStsResolution) - 1;
+      const int min_raw_position = joint_multi_turn_[i] ?
+        -kMaxMultiTurnTicks + feetech_driver::kStsMidpoint : 0;
+      if (raw_position < min_raw_position || raw_position > max_raw_position) {
         spdlog::error("Refusing out-of-range position command for joint '{}': {} rad (raw {})",
                       info_.joints[i].name,
                       position,
@@ -379,13 +553,16 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
   return hardware_interface::return_type::OK;
 }
 
-CallbackReturn FeetechHardwareInterface::on_activate(const rclcpp_lifecycle::State& /* previous_state */) {
+CallbackReturn FeetechHardwareInterface::on_activate(
+  const rclcpp_lifecycle::State & /* previous_state */)
+{
   active_.store(false, std::memory_order_release);
   lifecycle_active_.store(false, std::memory_order_release);
 
   std::scoped_lock lock(transport_mutex_);
   if (!connected_ || !read_bus_()) {
-    spdlog::error("FeetechHardwareInterface::on_activate failed to read the initial joint positions");
+    spdlog::error(
+        "FeetechHardwareInterface::on_activate failed to read the initial joint positions");
     return CallbackReturn::ERROR;
   }
 
@@ -397,15 +574,17 @@ CallbackReturn FeetechHardwareInterface::on_activate(const rclcpp_lifecycle::Sta
       continue;
     }
     if (!std::isfinite(hw_positions_[i])) {
-      spdlog::error("FeetechHardwareInterface::on_activate read a non-finite position for joint '{}'",
+      spdlog::error(
+          "FeetechHardwareInterface::on_activate read a non-finite position for joint '{}'",
                     info_.joints[i].name);
       return CallbackReturn::ERROR;
     }
     if (const auto result = communication_protocol_->set_torque(joint_ids_[i], true); !result) {
       spdlog::error("FeetechHardwareInterface::on_activate set_torque -> {}", result.error());
       const auto torque_disable_parameters =
-          std::vector(joint_ids_.size(), std::experimental::make_array(static_cast<uint8_t>(0)));
-      std::ignore = communication_protocol_->sync_write(joint_ids_, SMS_STS_TORQUE_ENABLE, torque_disable_parameters);
+        std::vector(joint_ids_.size(), std::experimental::make_array(static_cast<uint8_t>(0)));
+      std::ignore = communication_protocol_->sync_write(joint_ids_, SMS_STS_TORQUE_ENABLE,
+          torque_disable_parameters);
       return CallbackReturn::ERROR;
     }
   }
@@ -415,7 +594,9 @@ CallbackReturn FeetechHardwareInterface::on_activate(const rclcpp_lifecycle::Sta
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn FeetechHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& /* previous_state */) {
+CallbackReturn FeetechHardwareInterface::on_deactivate(
+  const rclcpp_lifecycle::State & /* previous_state */)
+{
   // Block write() before touching the bus or disabling torque.
   active_.store(false, std::memory_order_release);
   lifecycle_active_.store(false, std::memory_order_release);
@@ -427,17 +608,22 @@ CallbackReturn FeetechHardwareInterface::on_deactivate(const rclcpp_lifecycle::S
 
   // all joints torque off
   const auto torque_disable_parameters =
-      std::vector(joint_ids_.size(), std::experimental::make_array(static_cast<uint8_t>(0)));
+    std::vector(joint_ids_.size(), std::experimental::make_array(static_cast<uint8_t>(0)));
   if (const auto result =
-          communication_protocol_->sync_write(joint_ids_, SMS_STS_TORQUE_ENABLE, torque_disable_parameters);
-      !result) {
+    communication_protocol_->sync_write(joint_ids_, SMS_STS_TORQUE_ENABLE,
+      torque_disable_parameters);
+    !result)
+  {
     spdlog::error("FeetechHardwareInterface::on_deactivate -> {}", result.error());
     return CallbackReturn::ERROR;
   }
   return CallbackReturn::SUCCESS;
 }
 
-void FeetechHardwareInterface::mark_disconnected_(const std::string_view operation, const std::string_view error) {
+void FeetechHardwareInterface::mark_disconnected_(
+  const std::string_view operation,
+  const std::string_view error)
+{
   if (connected_) {
     spdlog::error("Feetech communication lost during {}: {}. Retrying every {} ms",
                   operation,
@@ -450,7 +636,8 @@ void FeetechHardwareInterface::mark_disconnected_(const std::string_view operati
   next_reconnect_attempt_ = std::chrono::steady_clock::now() + reconnect_interval_;
 }
 
-bool FeetechHardwareInterface::recover_connection_() {
+bool FeetechHardwareInterface::recover_connection_()
+{
   const auto now = std::chrono::steady_clock::now();
   if (now < next_reconnect_attempt_) {
     return false;
@@ -488,4 +675,5 @@ bool FeetechHardwareInterface::recover_connection_() {
 
 #include "pluginlib/class_list_macros.hpp"
 
-PLUGINLIB_EXPORT_CLASS(feetech_ros2_driver::FeetechHardwareInterface, hardware_interface::SystemInterface)
+PLUGINLIB_EXPORT_CLASS(feetech_ros2_driver::FeetechHardwareInterface,
+  hardware_interface::SystemInterface)

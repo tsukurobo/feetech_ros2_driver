@@ -9,6 +9,7 @@ The feetech system interface has a few `ros2_control` urdf tags to customize its
 #### Hardware Parameters
 
 * `usb_port` (required). Example: `<param name="usb_port">/dev/ttyUSB0</param>`.
+* `baud_rate` (optional): Servo bus baud rate. Defaults to `1000000`.
 * `joint_config_file` (optional): Path to a YAML file with per-joint parameters. If omitted, only URDF params are used (backward-compatible). See [YAML Joint Configuration](#yaml-joint-configuration-file) below.
 * `auto_reconnect` (optional): Reopen the serial port and restore communication after a runtime USB or servo power interruption. Defaults to `true`.
 * `reconnect_interval_ms` (optional): Minimum delay between reconnection attempts in milliseconds. Defaults to `1000`.
@@ -22,14 +23,15 @@ Make sure to look at [Memory table](https://docs.google.com/spreadsheets/d/1GVs7
 * `i_coefficient` (optional): Integral coefficient of the PID controller. Example: `<param name="i_coefficient">0</param>`.
 * `d_coefficient` (optional): Derivative coefficient of the PID controller. Example: `<param name="d_coefficient">32</param>`.
 * `homing_offset` (optional): Signed offset written to the servo's EEPROM. The servo firmware applies `Present_Position = Actual_Position - Homing_Offset`, so setting `homing_offset = actual_position - 2048` makes the servo report 2048 (center) at your desired physical center. If migrating from the old `offset` parameter: `homing_offset = old_offset - 2048` (since the old offset was effectively the actual position at center).
-* `range_min` (optional): Minimum angle limit (raw ticks, after homing offset is applied).
-* `range_max` (optional): Maximum angle limit (raw ticks, after homing offset is applied).
+* `multi_turn` (optional): Set to `true` for STS3215 signed multi-turn position commands and feedback. The driver enables Phase bit 4 and forces both angle limits to zero, then reads the Phase and angle-limit registers back to verify the configuration. The ROS position remains centered at 2048 and is limited to ±7 motor rotations. Turn count is not retained after servo power loss. Defaults to `false`.
+* `range_min` (optional): Minimum angle limit (raw ticks, after homing offset is applied). Forced to `0` when `multi_turn` is enabled.
+* `range_max` (optional): Maximum angle limit (raw ticks, after homing offset is applied). Forced to `0` when `multi_turn` is enabled.
 * `max_torque_limit` (optional): Maximum torque limit.
 * `protection_current` (optional): Protection current threshold.
 * `overload_torque` (optional): Overload torque threshold.
 * `return_delay_time` (optional): Response delay time.
-* `speed` (optional): Position command speed in raw servo units (0–32767). Defaults to 2400.
-* `acceleration` (optional): Position command acceleration in raw servo units (0–254). Defaults to 50.
+* `speed` (optional): Position command speed written to addresses 46–47 in raw servo units (0–32767). Defaults to 2400. Select a practical value for the connected servo model.
+* `acceleration` (optional): Position command acceleration written to address 41 in raw servo units (0–254). Defaults to 50.
 
 ### Example
 

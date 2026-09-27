@@ -56,6 +56,7 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   std::vector<uint8_t> joint_ids_;
   std::vector<int> joint_speeds_;
   std::vector<int> joint_accelerations_;
+  std::vector<bool> joint_multi_turn_;
   std::atomic_bool active_{false};
   std::atomic_bool lifecycle_active_{false};
   bool connected_{false};
