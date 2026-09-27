@@ -43,25 +43,6 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
   lifecycle_active_.store(false, std::memory_order_relaxed);
   spdlog::info("Feetech safety guards enabled: activation gate and command validation");
 
-  if (init_transport_() != CallbackReturn::SUCCESS) {
-    return CallbackReturn::ERROR;
-  }
-
-  JointIdConfigMap yaml_by_id;
-  if (load_yaml_config_and_warn_(yaml_by_id) != CallbackReturn::SUCCESS) {
-    return CallbackReturn::ERROR;
-  }
-
-  if (configure_joints_(yaml_by_id) != CallbackReturn::SUCCESS) {
-    return CallbackReturn::ERROR;
-  }
-
-  if (validate_model_series_() != CallbackReturn::SUCCESS) {
-    return CallbackReturn::ERROR;
-  }
-
-  connected_ = true;
-
   if (const auto it = info_.hardware_parameters.find("auto_reconnect");
     it != info_.hardware_parameters.end())
   {
@@ -78,6 +59,52 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
     reconnect_interval_ = std::chrono::milliseconds(interval_ms);
   }
 
+  const auto usb_port_it = info_.hardware_parameters.find("usb_port");
+  if (usb_port_it == info_.hardware_parameters.end() || usb_port_it->second.empty()) {
+    spdlog::error("Hardware parameter [usb_port] is required and must not be empty");
+    return CallbackReturn::ERROR;
+  }
+  if (const auto baud_rate_it = info_.hardware_parameters.find("baud_rate");
+    baud_rate_it != info_.hardware_parameters.end())
+  {
+    try {
+      if (!feetech_driver::to_baudrate(std::stoul(baud_rate_it->second))) {
+        spdlog::error("Invalid baud_rate: {}", baud_rate_it->second);
+        return CallbackReturn::ERROR;
+      }
+    } catch (const std::exception & error) {
+      spdlog::error("Invalid baud_rate {}: {}", baud_rate_it->second, error.what());
+      return CallbackReturn::ERROR;
+    }
+  }
+
+  JointIdConfigMap yaml_by_id;
+  if (load_yaml_config_and_warn_(yaml_by_id) != CallbackReturn::SUCCESS) {
+    return CallbackReturn::ERROR;
+  }
+
+  // Parse and validate local configuration before touching the bus.
+  if (configure_joints_(yaml_by_id) != CallbackReturn::SUCCESS) {
+    return CallbackReturn::ERROR;
+  }
+
+  if (init_transport_() == CallbackReturn::SUCCESS &&
+    configure_joints_(yaml_by_id) == CallbackReturn::SUCCESS &&
+    validate_model_series_() == CallbackReturn::SUCCESS)
+  {
+    connected_ = true;
+    return CallbackReturn::SUCCESS;
+  }
+
+  communication_protocol_.reset();
+  connected_ = false;
+  next_reconnect_attempt_ = std::chrono::steady_clock::now() + reconnect_interval_;
+  if (!auto_reconnect_) {
+    return CallbackReturn::ERROR;
+  }
+  spdlog::warn(
+    "Feetech is unavailable during initialization; starting disconnected and retrying every {} ms",
+    reconnect_interval_.count());
   return CallbackReturn::SUCCESS;
 }
 
@@ -160,6 +187,7 @@ CallbackReturn FeetechHardwareInterface::load_yaml_config_and_warn_(JointIdConfi
 
 CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMap & yaml_by_id)
 {
+  const bool configure_hardware = communication_protocol_ != nullptr;
   joint_ids_.assign(info_.joints.size(), 0);
   joint_speeds_.assign(info_.joints.size(), 2400);
   joint_accelerations_.assign(info_.joints.size(), 50);
@@ -236,6 +264,10 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
       spdlog::error("Joint '{}': acceleration must be in [0, 254], got {}", joint_name,
           joint_accelerations_[i]);
       return CallbackReturn::ERROR;
+    }
+
+    if (!configure_hardware) {
+      continue;
     }
 
     // Disable torque and unlock EPROM before writing parameters
@@ -560,10 +592,24 @@ CallbackReturn FeetechHardwareInterface::on_activate(
   lifecycle_active_.store(false, std::memory_order_release);
 
   std::scoped_lock lock(transport_mutex_);
-  if (!connected_ || !read_bus_()) {
+  if (!connected_) {
+    if (!auto_reconnect_) {
+      spdlog::error("FeetechHardwareInterface::on_activate: Feetech is not connected");
+      return CallbackReturn::ERROR;
+    }
+    lifecycle_active_.store(true, std::memory_order_release);
+    next_reconnect_attempt_ = std::chrono::steady_clock::time_point{};
+    spdlog::warn("Activating while Feetech is disconnected; waiting for automatic reconnection");
+    return CallbackReturn::SUCCESS;
+  }
+  if (!read_bus_()) {
     spdlog::error(
         "FeetechHardwareInterface::on_activate failed to read the initial joint positions");
-    return CallbackReturn::ERROR;
+    if (!auto_reconnect_) {
+      return CallbackReturn::ERROR;
+    }
+    lifecycle_active_.store(true, std::memory_order_release);
+    return CallbackReturn::SUCCESS;
   }
 
   // Set the initial command to current joint positions
@@ -648,10 +694,16 @@ bool FeetechHardwareInterface::recover_connection_()
     communication_protocol_.reset();
     return false;
   }
-  connected_ = true;
-  if (validate_model_series_() != CallbackReturn::SUCCESS || !read_bus_()) {
+  JointIdConfigMap yaml_by_id;
+  if (load_yaml_config_and_warn_(yaml_by_id) != CallbackReturn::SUCCESS ||
+    configure_joints_(yaml_by_id) != CallbackReturn::SUCCESS ||
+    validate_model_series_() != CallbackReturn::SUCCESS)
+  {
     communication_protocol_.reset();
-    connected_ = false;
+    return false;
+  }
+  connected_ = true;
+  if (!read_bus_()) {
     return false;
   }
 
