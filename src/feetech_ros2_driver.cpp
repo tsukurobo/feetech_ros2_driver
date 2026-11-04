@@ -266,8 +266,52 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
       return CallbackReturn::ERROR;
     }
 
+    std::vector<std::pair<uint8_t, uint8_t>> internal_parameters;
+    try {
+      if (const auto it = merged_params.find("return_delay_time"); it != merged_params.end()) {
+        size_t parsed = 0;
+        const int value = std::stoi(it->second, &parsed);
+        if (parsed != it->second.size() || value < 0 || value > 254)
+          throw std::invalid_argument("return_delay_time must be in [0, 254]");
+      }
+      for (const auto & [name, address] : {
+          std::pair{"internal_vmax", 84}, {"internal_amax", 85}, {"internal_kacc", 86},
+          {"velocity_i_gain", 39}, {"experimental_dts", 81}})
+      {
+        if (const auto it = merged_params.find(name); it != merged_params.end()) {
+          size_t parsed = 0;
+          const int value = std::stoi(it->second, &parsed);
+          if (parsed != it->second.size() || value < (address == 81 ? 1 : 0) || value > 254) {
+            throw std::invalid_argument(std::string(name) + " must be in [0, 254] (DTs: [1, 254])");
+          }
+          internal_parameters.emplace_back(static_cast<uint8_t>(address), static_cast<uint8_t>(value));
+        }
+      }
+      if (!internal_parameters.empty() &&
+          (!merged_params.contains("allow_experimental_internal_parameters") ||
+           merged_params.at("allow_experimental_internal_parameters") != "true"))
+      {
+        throw std::invalid_argument("Set allow_experimental_internal_parameters=true to use experimental parameters");
+      }
+    } catch (const std::exception & error) {
+      spdlog::error("Joint '{}': {}", joint_name, error.what());
+      return CallbackReturn::ERROR;
+    }
+
+    if (!internal_parameters.empty()) auto_reconnect_ = false;
+
     if (!configure_hardware) {
       continue;
+    }
+
+    if (!internal_parameters.empty()) {
+      const auto model = communication_protocol_->read_model_number(joint_ids_[i]);
+      std::array<uint8_t, 2> firmware{};
+      const auto result = communication_protocol_->read(joint_ids_[i], 0, &firmware);
+      if (!model || !result || *model != 777 || firmware[0] != 3 || firmware[1] != 10) {
+        spdlog::error("Joint '{}': experimental parameters require STS3215 (model 777), firmware 3.10", joint_name);
+        return CallbackReturn::ERROR;
+      }
     }
 
     // Disable torque and unlock EPROM before writing parameters
@@ -396,6 +440,28 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
           spdlog::error("FeetechHardwareInterface::configure_joints_ -> {}", result.error());
           return CallbackReturn::ERROR;
         }
+      }
+    }
+
+    for (const auto & [address, value] : internal_parameters) {
+      std::array<uint8_t, 1> current{};
+      if (const auto result = communication_protocol_->read(joint_ids_[i], address, &current); !result) {
+        spdlog::error("Joint '{}': read register {} failed: {}", joint_name, address, result.error());
+        (void)communication_protocol_->lock_eprom(joint_ids_[i]);
+        return CallbackReturn::ERROR;
+      }
+      spdlog::info("Joint '{}': experimental register {}: {} -> {}", joint_name, address, current[0], value);
+      if (current[0] == value) continue;
+      if (const auto result = communication_protocol_->write(joint_ids_[i], address, std::array<uint8_t, 1>{value}); !result) {
+        spdlog::error("Joint '{}': write register {} failed: {}", joint_name, address, result.error());
+        (void)communication_protocol_->lock_eprom(joint_ids_[i]);
+        return CallbackReturn::ERROR;
+      }
+      const auto result = communication_protocol_->read(joint_ids_[i], address, &current);
+      if (!result || current[0] != value) {
+        spdlog::error("Joint '{}': register {} readback failed or mismatched", joint_name, address);
+        (void)communication_protocol_->lock_eprom(joint_ids_[i]);
+        return CallbackReturn::ERROR;
       }
     }
 

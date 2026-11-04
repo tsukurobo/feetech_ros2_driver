@@ -74,3 +74,37 @@ Pass the YAML file path as a hardware parameter:
 
 * URDF-only setup: [ros2_so_arm100](https://github.com/JafarAbdi/ros2_so_arm100/blob/main/so_arm100_description/control/so_arm100.ros2_control.xacro)
 * YAML config setup: [so101-ros-physical-ai](https://github.com/legalaspro/so101-ros-physical-ai) — see [follower](https://github.com/legalaspro/so101-ros-physical-ai/blob/main/so101_bringup/config/hardware/follower_joints.yaml) and [leader](https://github.com/legalaspro/so101-ros-physical-ai/blob/main/so101_bringup/config/hardware/leader_joints.yaml) arm configs.
+
+## Experimental STS3215 internal parameters
+
+`internal_vmax` (84), `internal_amax` (85), and `internal_kacc` (86) accept raw
+one-byte values 0–254 through the existing per-joint URDF/YAML mechanism.
+They are separate from command `speed` and `acceleration`. Omitted values are not written.
+Set `allow_experimental_internal_parameters: true` on the joint to enable them.
+Only STS3215 model bytes 9,3 (777) and firmware bytes 3,10 are accepted.
+The byte range is an implementation limit, not a validated mechanical operating range.
+
+```yaml
+joints:
+  servo:
+    id: 1
+    allow_experimental_internal_parameters: true
+    internal_vmax: 100
+    internal_amax: 80
+    internal_kacc: 10
+```
+
+Current values are read and logged before modification, identical values are skipped,
+and writes are read back. To restore, put the logged original values back in the
+URDF/YAML. Removing a parameter does not restore the servo register.
+`velocity_i_gain` (39, 0–254) and `experimental_dts` (81, 1–254) use the same
+experimental opt-in and firmware check. DTs is a label from the experiment;
+its exact control-period semantics and storage behavior remain unverified.
+An explicit experimental setting also disables automatic reconnect/reconfiguration.
+`return_delay_time` (7, 0–254) and `acceleration` (41, 0–254) remain normal parameters.
+
+The [published table](https://ftservo.github.io/ftservo-wiki/reference/parameter/memory-sts/)
+marks 84–86 as read-only factory parameters, while
+[the FW3.10 experiment](https://zamantika.com/devemin/status/2094640983199842636)
+reports direct writes and faster movement. Meaning, persistence and compatibility
+across builds are not established by that report; firmware 3.10 is not a guarantee.
