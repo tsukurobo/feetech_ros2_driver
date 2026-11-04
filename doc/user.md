@@ -100,7 +100,6 @@ URDF/YAML. Removing a parameter does not restore the servo register.
 `velocity_i_gain` (39, 0–254) and `experimental_dts` (81, 1–254) use the same
 experimental opt-in and firmware check. DTs is a label from the experiment;
 its exact control-period semantics and storage behavior remain unverified.
-An explicit experimental setting also disables automatic reconnect/reconfiguration.
 `return_delay_time` (7, 0–254) and `acceleration` (41, 0–254) remain normal parameters.
 
 The [published table](https://ftservo.github.io/ftservo-wiki/reference/parameter/memory-sts/)
@@ -108,3 +107,18 @@ marks 84–86 as read-only factory parameters, while
 [the FW3.10 experiment](https://zamantika.com/devemin/status/2094640983199842636)
 reports direct writes and faster movement. Meaning, persistence and compatibility
 across builds are not established by that report; firmware 3.10 is not a guarantee.
+
+## Feedback in /dynamic_joint_states
+
+Declare `voltage`, `temperature`, `current`, `servo_status`, and `connected` state
+interfaces on each joint, alongside position and velocity. The joint state
+broadcaster publishes them in `/dynamic_joint_states` using the existing sync read
+(registers 56–70). Units are V, degrees Celsius and A (signed, 6.5 mA/count).
+`servo_status` is the raw register 65 bitmask: 1 voltage, 2 magnetic encoder,
+4 temperature, 8 current, 32 overload. See the
+[STS register table](https://ftservo.github.io/ftservo-wiki/reference/parameter/memory-sts/).
+`connected` is 1 after successful feedback and 0 when disconnected; additional
+feedback is NaN until first feedback or after a communication failure. Position
+and velocity retain their existing behavior. A failed group read invalidates all
+servos, so `connected=0` does not identify the faulty servo. Short events between
+polls and values during a complete power loss cannot be captured.

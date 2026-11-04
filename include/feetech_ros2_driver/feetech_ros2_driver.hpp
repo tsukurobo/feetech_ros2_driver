@@ -51,6 +51,8 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   std::vector<double> hw_positions_;
   std::vector<double> state_hw_positions_;
   std::vector<double> state_hw_velocities_;
+  std::vector<double> state_hw_voltage_, state_hw_temperature_, state_hw_current_;
+  std::vector<double> state_hw_servo_status_, state_hw_connected_;
   std::vector<uint8_t> previous_hw_positions_;
 
   std::vector<uint8_t> joint_ids_;

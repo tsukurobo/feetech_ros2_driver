@@ -298,8 +298,6 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
       return CallbackReturn::ERROR;
     }
 
-    if (!internal_parameters.empty()) auto_reconnect_ = false;
-
     if (!configure_hardware) {
       continue;
     }
@@ -518,11 +516,22 @@ std::vector<hardware_interface::StateInterface> FeetechHardwareInterface::export
   std::vector<hardware_interface::StateInterface> state_interfaces;
   state_hw_positions_.resize(info_.joints.size(), 0.0);
   state_hw_velocities_.resize(info_.joints.size(), 0.0);
+  const auto unknown = std::numeric_limits<double>::quiet_NaN();
+  state_hw_voltage_.assign(info_.joints.size(), unknown);
+  state_hw_temperature_.assign(info_.joints.size(), unknown);
+  state_hw_current_.assign(info_.joints.size(), unknown);
+  state_hw_servo_status_.assign(info_.joints.size(), unknown);
+  state_hw_connected_.assign(info_.joints.size(), 0.0);
   for (uint i = 0; i < info_.joints.size(); i++) {
     state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION,
         &state_hw_positions_[i]);
     state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_VELOCITY,
         &state_hw_velocities_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "voltage", &state_hw_voltage_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "temperature", &state_hw_temperature_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "current", &state_hw_current_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "servo_status", &state_hw_servo_status_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "connected", &state_hw_connected_[i]);
   }
 
   return state_interfaces;
@@ -561,7 +570,7 @@ hardware_interface::return_type FeetechHardwareInterface::read(
 
 bool FeetechHardwareInterface::read_bus_()
 {
-  std::vector<std::array<uint8_t, 4>> data;
+  std::vector<std::array<uint8_t, 15>> data;
   data.reserve(joint_ids_.size());
   if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L,
       &data); !result)
@@ -576,6 +585,12 @@ bool FeetechHardwareInterface::read_bus_()
       const int position = joint_multi_turn_[index] ?
       feetech_driver::decode_sign_magnitude(encoded_position, SMS_STS_SIGN_BIT_POSITION) :
       encoded_position;
+      state_hw_voltage_[index] = readings[6] * 0.1;
+      state_hw_temperature_[index] = readings[7];
+      state_hw_servo_status_[index] = readings[9];
+      state_hw_current_[index] = 0.0065 * feetech_driver::decode_sign_magnitude(
+        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[13], .high = readings[14]}), 15);
+      state_hw_connected_[index] = 1.0;
       state_hw_positions_[index] =
       feetech_driver::to_radians(position - feetech_driver::kStsMidpoint);
       const int encoded_velocity = feetech_driver::from_sts(
@@ -743,6 +758,11 @@ void FeetechHardwareInterface::mark_disconnected_(
                   reconnect_interval_.count());
   }
   connected_ = false;
+  for (size_t i = 0; i < state_hw_connected_.size(); ++i) {
+    state_hw_connected_[i] = 0.0;
+    state_hw_voltage_[i] = state_hw_temperature_[i] = state_hw_current_[i] =
+      state_hw_servo_status_[i] = std::numeric_limits<double>::quiet_NaN();
+  }
   active_.store(false, std::memory_order_release);
   communication_protocol_.reset();
   next_reconnect_attempt_ = std::chrono::steady_clock::now() + reconnect_interval_;
